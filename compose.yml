@@ -1,0 +1,25 @@
+services:
+  backend:
+    image: 442042522885.dkr.ecr.us-east-1.amazonaws.com/library/backend:latest
+    build:
+      context: ./backend
+    ports:
+      - "3000:3000"
+    environment:
+      - AWS_REGION=us-east-1
+    logging:
+      driver: "awslogs"
+      options:
+        awslogs-region: "us-east-1"
+        awslogs-group: "/app/backend"
+        awslogs-stream: "upload-service"
+        awslogs-create-group: "true"
+
+  frontend:
+    image: 442042522885.dkr.ecr.us-east-1.amazonaws.com/library/frontend:latest
+    build: 
+      context: ./frontend
+      args:
+        - VITE_API_URL=http://3.93.199.57:3000
+    ports:
+      - "80:8080"
