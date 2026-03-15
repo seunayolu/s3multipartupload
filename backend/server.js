@@ -2,124 +2,122 @@ import express from 'express';
 import multer from 'multer';
 import cors from 'cors';
 import { SSMClient, GetParametersCommand } from "@aws-sdk/client-ssm";
-import { S3Client } from "@aws-sdk/client-s3";
+import { 
+  S3Client, 
+  CreateMultipartUploadCommand, 
+  UploadPartCommand, 
+  CompleteMultipartUploadCommand, 
+  AbortMultipartUploadCommand 
+} from "@aws-sdk/client-s3";
 import { DynamoDBClient, PutItemCommand } from "@aws-sdk/client-dynamodb";
-import { Upload } from "@aws-sdk/lib-storage";
 
 const app = express();
 app.use(cors());
 app.use(express.json());
 
-// Memory storage is used so we don't fill up the EC2 disk with temporary 1GB files
 const upload = multer({ storage: multer.memoryStorage() });
+const region = process.env.AWS_REGION || "us-east-1";
 
-const ssm = new SSMClient();
+const ssm = new SSMClient({ region });
 let s3, dynamo, config = {};
 
-/**
- * PHASE 1: BOOTSTRAP
- * Fetches Bucket and Table names from SSM at startup.
- */
+app.get('/health', (req, res) => res.status(200).send('OK'));
+
 async function bootstrap() {
-  console.log("[STARTUP] Initializing: Fetching configuration from SSM...");
-  
   try {
-    const command = new GetParametersCommand({
+    const { Parameters } = await ssm.send(new GetParametersCommand({
       Names: ["/app/s3-bucket", "/app/dynamo-table"],
       WithDecryption: true
-    });
-
-    const { Parameters } = await ssm.send(command);
+    }));
     
-    // Map parameters to our config object for easy access
     Parameters.forEach(p => {
       const key = p.Name.split('/').pop().replace('-', '');
       config[key] = p.Value;
     });
 
-    // Verify we got what we needed
-    if (!config.s3bucket || !config.dynamotable) {
-      throw new Error("Missing required SSM parameters: /app/s3-bucket or /app/dynamo-table");
-    }
-
-    s3 = new S3Client();
-    dynamo = new DynamoDBClient();
-
-    console.log(`[STARTUP] Success: Using Bucket [${config.s3bucket}] and Table [${config.dynamotable}]`);
+    s3 = new S3Client({ region });
+    dynamo = new DynamoDBClient({ region });
     
-    app.listen(3000, () => console.log("Backend active on port 3000"));
+    app.listen(3000, () => console.log("🚀 Manual Multipart Backend active on port 3000"));
   } catch (err) {
-    console.error("[FATAL ERROR] Bootstrap failed. The application will now exit.", err.message);
-    process.exit(1); 
+    console.error("Bootstrap Error:", err);
+    process.exit(1);
   }
 }
 
-// Health Check Endpoint
-app.get('/health', (req, res) => {
-  res.status(200).send('OK');
-});
-
-/**
- * PHASE 2: THE UPLOAD HANDLER
- * Handles the file stream and the subsequent database entry.
- */
 app.post('/upload', upload.single('file'), async (req, res) => {
   const metadata = JSON.parse(req.body.metadata);
   const file = req.file;
-
-  if (!file) {
-    return res.status(400).send("No file received.");
-  }
+  const key = `${metadata.category}/${Date.now()}-${file.originalname}`;
+  let uploadId;
 
   try {
-    console.log(`[LOG] Starting Multi-part upload for ${metadata.category}: "${metadata.title}"`);
+    // --- PHASE 1: INITIATE ---
+    const init = await s3.send(new CreateMultipartUploadCommand({
+      Bucket: config.s3bucket,
+      Key: key,
+      ContentType: file.mimetype
+    }));
+    uploadId = init.UploadId;
+    console.log(`[S3] Handshake Started. UploadId: ${uploadId}`);
 
-    // 1. Stream to S3
-    const task = new Upload({
-      client: s3,
-      params: {
+    const CHUNK_SIZE = 1024 * 1024 * 5; // 5MB
+    const totalParts = Math.ceil(file.size / CHUNK_SIZE);
+    const completedParts = [];
+
+    // --- PHASE 2: CHUNKING ---
+    for (let i = 0; i < totalParts; i++) {
+      const start = i * CHUNK_SIZE;
+      const end = Math.min(start + CHUNK_SIZE, file.size);
+      const partNum = i + 1;
+
+      const partResponse = await s3.send(new UploadPartCommand({
         Bucket: config.s3bucket,
-        Key: `${metadata.category}/${Date.now()}-${file.originalname}`,
-        Body: file.buffer,
-        ContentType: file.mimetype
-      },
-      partSize: 1024 * 1024 * 5, // 5MB Chunks
-      queueSize: 3 // How many chunks to upload concurrently
-    });
+        Key: key,
+        UploadId: uploadId,
+        PartNumber: partNum,
+        Body: file.buffer.subarray(start, end)
+      }));
 
-    task.on("httpUploadProgress", (progress) => {
-      // These logs will show up in CloudWatch via the EC2 console/logs
-      const percent = Math.round((progress.loaded / progress.total) * 100);
-      console.log(`[PROGRESS] Uploading ${metadata.title}: ${percent}%`);
-    });
+      console.log(`[S3] Part ${partNum}/${totalParts} uploaded. ETag: ${partResponse.ETag}`);
+      completedParts.push({ ETag: partResponse.ETag, PartNumber: partNum });
+    }
 
-    await task.done();
-    console.log(`[SUCCESS] File stored in S3 bucket: ${config.s3bucket}`);
+    // --- PHASE 3: FINALIZE ---
+    const finalResult = await s3.send(new CompleteMultipartUploadCommand({
+      Bucket: config.s3bucket,
+      Key: key,
+      UploadId: uploadId,
+      MultipartUpload: { Parts: completedParts }
+    }));
 
-    // 2. Save Metadata to DynamoDB
-    const dbItem = {
+    // Construct the file URL
+    const fileUrl = `https://${config.s3bucket}.s3.${region}.amazonaws.com/${key}`;
+    console.log(`[S3] Finished. Final ETag: ${finalResult.ETag}`);
+
+    // --- PHASE 4: PERSIST ---
+    await dynamo.send(new PutItemCommand({
       TableName: config.dynamotable,
       Item: {
         "FileID": { S: Date.now().toString() },
-        "Category": { S: metadata.category },
         "Title": { S: metadata.title },
-        "Year": { N: metadata.year.toString() },
-        "Description": { S: metadata.description || "N/A" },
-        "Author": metadata.details.author ? { S: metadata.details.author } : { NULL: true },
-        "ISBN": metadata.details.isbn ? { S: metadata.details.isbn } : { NULL: true },
-        "Artist": metadata.details.artist ? { S: metadata.details.artist } : { NULL: true },
-        "Resolution": metadata.details.resolution ? { S: metadata.details.resolution } : { NULL: true }
+        "Category": { S: metadata.category },
+        "S3_Url": { S: fileUrl },
+        "S3_ETag": { S: finalResult.ETag },
+        "FileSize_MB": { N: (file.size / (1024 * 1024)).toFixed(2) }
       }
-    };
+    }));
 
-    await dynamo.send(new PutItemCommand(dbItem));
-    console.log(`[SUCCESS] Metadata indexed in DynamoDB: ${config.dynamotable}`);
-
-    res.status(200).json({ status: "Complete", message: "Successfully uploaded and indexed." });
+    res.status(200).json({ status: "Success", url: fileUrl });
 
   } catch (err) {
-    console.error("[UPLOAD ERROR]", err);
-    res.status(500).json({ status: "Error", message: err.message });
+    console.error("[S3 ERROR]", err);
+    if (uploadId) {
+      await s3.send(new AbortMultipartUploadCommand({ 
+        Bucket: config.s3bucket, Key: key, UploadId: uploadId 
+      }));
+    }
+    res.status(500).json({ error: err.message });
   }
 });
 
